@@ -2,6 +2,7 @@
 
 #include <Alert.h>
 #include <Application.h>
+#include <Entry.h>
 #include <File.h>
 #include <FilePanel.h>
 #include <LayoutBuilder.h>
@@ -19,9 +20,13 @@
 #include <TextView.h>
 
 #include <algorithm>
+#include <errno.h>
+#include <fs_attr.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "AppMessages.h"
 #include "RunProcess.h"
@@ -102,9 +107,23 @@ Join(const std::vector<std::string>& lines)
 }
 
 
-/** Writes data to the file a save panel chose; file stays open for attrs. */
+/**
+ * Saves data to the file a save panel chose without risking the old file.
+ *
+ * The data goes to a temporary file in the same directory, which is renamed
+ * over the target only once it is completely written; on failure the target
+ * is untouched and the temporary file is removed. An existing target's mode
+ * and attributes are carried over, and a symlink is followed, not replaced.
+ *
+ * @param message  The save panel's B_SAVE_REQUESTED-style message.
+ * @param data     The bytes to save.
+ * @param type     The MIME type to give the file.
+ * @param keepType If true, an existing target's own type wins over @a type.
+ * @return B_OK, or the error that stopped the save.
+ */
 static status_t
-WriteSaveTarget(const BMessage* message, const std::string& data, BFile& file)
+WriteSaveTarget(const BMessage* message, const std::string& data,
+	const char* type, bool keepType)
 {
 	entry_ref directory;
 	const char* name;
@@ -114,16 +133,73 @@ WriteSaveTarget(const BMessage* message, const std::string& data, BFile& file)
 
 	BPath path(&directory);
 	status_t status = path.Append(name);
-	if (status == B_OK)
-		status = file.SetTo(path.Path(), B_WRITE_ONLY | B_CREATE_FILE
-			| B_ERASE_FILE);
-	if (status == B_OK) {
-		ssize_t written = file.Write(data.data(), data.size());
-		if (written < 0)
-			status = written;
-		else if ((size_t)written != data.size())
-			status = B_IO_ERROR;
+	if (status != B_OK)
+		return status;
+	// Save through a symlink to the file it points at.
+	status = BEntry(path.Path(), true).GetPath(&path);
+	if (status != B_OK)
+		return status;
+
+	struct stat targetStat;
+	bool exists = stat(path.Path(), &targetStat) == 0;
+	// Renaming would sidestep a read-only file, which plain writing refused.
+	if (exists && access(path.Path(), W_OK) != 0)
+		return errno;
+
+	BPath parent;
+	status = path.GetParent(&parent);
+	if (status != B_OK)
+		return status;
+	char tempPath[B_PATH_NAME_LENGTH];
+	snprintf(tempPath, sizeof(tempPath), "%s/.%s.patchwork-%" B_PRIdBIGTIME,
+		parent.Path(), path.Leaf(), system_time());
+
+	BFile file;
+	status = file.SetTo(tempPath, B_WRITE_ONLY | B_CREATE_FILE
+		| B_FAIL_IF_EXISTS);
+	if (status != B_OK)
+		return status;
+
+	ssize_t written = file.Write(data.data(), data.size());
+	if (written < 0)
+		status = written;
+	else if ((size_t)written != data.size())
+		status = B_IO_ERROR;
+
+	if (status == B_OK && exists) {
+		status = file.SetPermissions(targetStat.st_mode);
+		BNode target(path.Path());
+		if (status == B_OK)
+			status = target.InitCheck();
+		char attrName[B_ATTR_NAME_LENGTH];
+		while (status == B_OK && target.GetNextAttrName(attrName) == B_OK) {
+			attr_info info;
+			status = target.GetAttrInfo(attrName, &info);
+			if (status != B_OK)
+				break;
+			std::vector<char> buffer(info.size);
+			ssize_t size = target.ReadAttr(attrName, info.type, 0,
+				buffer.data(), buffer.size());
+			if (size >= 0)
+				size = file.WriteAttr(attrName, info.type, 0, buffer.data(),
+					size);
+			if (size < 0)
+				status = size;
+		}
 	}
+
+	if (status == B_OK) {
+		BNodeInfo nodeInfo(&file);
+		char existingType[B_MIME_TYPE_LENGTH];
+		if (!keepType || nodeInfo.GetType(existingType) != B_OK)
+			status = nodeInfo.SetType(type);
+	}
+	if (status == B_OK)
+		status = file.Sync();
+	if (status == B_OK && rename(tempPath, path.Path()) != 0)
+		status = errno;
+	if (status != B_OK)
+		unlink(tempPath);
 	return status;
 }
 
@@ -646,20 +722,13 @@ void
 MergeWindow::_SaveMerge(const BMessage* message)
 {
 	std::string text = _MergeText();
-	BFile file;
-	status_t status = WriteSaveTarget(message, text, file);
-	if (status == B_OK) {
-		// Keep an overwritten file's type, else take the right file's.
-		BNodeInfo info(&file);
-		char type[B_MIME_TYPE_LENGTH];
-		if (info.GetType(type) != B_OK) {
-			BNode rightNode(fRightPath.Path());
-			BNodeInfo rightInfo(&rightNode);
-			if (rightInfo.GetType(type) != B_OK)
-				strlcpy(type, "text/plain", sizeof(type));
-			status = info.SetType(type);
-		}
-	}
+	// Keep an overwritten file's type, else take the right file's.
+	BNode rightNode(fRightPath.Path());
+	BNodeInfo rightInfo(&rightNode);
+	char type[B_MIME_TYPE_LENGTH];
+	if (rightInfo.GetType(type) != B_OK)
+		strlcpy(type, "text/plain", sizeof(type));
+	status_t status = WriteSaveTarget(message, text, type, true);
 	if (status != B_OK) {
 		fCloseAfterSave = false;
 		ShowAlert("Save failed", strerror(status), B_STOP_ALERT);
@@ -690,10 +759,7 @@ MergeWindow::_SavePatch(const BMessage* message)
 		return;
 	}
 
-	BFile file;
-	status_t status = WriteSaveTarget(message, out, file);
-	if (status == B_OK)
-		status = BNodeInfo(&file).SetType("text/x-patch");
+	status_t status = WriteSaveTarget(message, out, "text/x-patch", false);
 	if (status != B_OK)
 		ShowAlert("Save failed", strerror(status), B_STOP_ALERT);
 }
