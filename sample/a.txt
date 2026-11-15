@@ -1,0 +1,12 @@
+The quick brown fox
+jumps over
+the lazy dog.
+Keep this line.
+And this one.
+Old line to change
+another old line
+shared middle
+remove me
+remove me too
+shared tail
+last line
